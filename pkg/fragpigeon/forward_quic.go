@@ -33,7 +33,7 @@ func (p *Pigeon) ForwardRemote(h Header, payload []byte) {
 			continue
 		}
 		if _, err := str.Write(frame); err != nil {
-			log.Printf("forward write: %v", err)
+			log.Printf("forward write err: %v", err)
 		}
 		_ = str.Close()
 	}

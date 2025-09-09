@@ -153,7 +153,7 @@ func (qp *quicPeers) acceptLoop(ln *quic.Listener) {
 	for {
 		c, err := ln.Accept(context.Background())
 		if err != nil {
-			log.Printf("quic accept: %v", err)
+			log.Printf("quic accept err: %v", err)
 			continue
 		}
 		qp.attachConn(qConn{inner: c})
@@ -170,7 +170,7 @@ func (qp *quicPeers) dialLoop(addr string) {
 		})
 		cancel()
 		if err != nil {
-			log.Printf("quic dial %s: %v", addr, err)
+			log.Printf("quic dial %s err: %v", addr, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -199,7 +199,7 @@ func (qp *quicPeers) acceptReadLoop(c connLike) {
 		str, err := c.AcceptStream(context.Background())
 		//log.Printf("pigeon (%d): quic accepted stream", qp.p.siteID)
 		if err != nil {
-			log.Printf("control accept: %v", err)
+			log.Printf("control accept err: %v", err)
 			_ = c.CloseWithAppError(0, "")
 			return
 		}
@@ -217,7 +217,7 @@ func (qp *quicPeers) readControlStream(c connLike, str streamLike) {
 			if err == io.EOF || err == net.ErrClosed {
 				qp.handleControlFrames(c, buf[:n])
 			} else {
-				log.Printf("control error: %v", err)
+				log.Printf("control err: %v", err)
 			}
 			_ = str.Close()
 			return
@@ -226,7 +226,7 @@ func (qp *quicPeers) readControlStream(c connLike, str streamLike) {
 }
 
 func (qp *quicPeers) handleControlFrames(c connLike, b []byte) {
-	log.Printf("control frame: %v %d bytes", b, len(b))
+	//log.Printf("control frame: %v %d bytes", b, len(b))
 	i := 0
 	for i+8 <= len(b) {
 		op := b[i+0]

@@ -181,7 +181,7 @@ func (p *Pigeon) SnapshotCOIs() []GossipEntry {
 // called when we learn remote COIs
 func (p *Pigeon) ApplyRemote(op byte, siteID uint16, ents []GossipEntry) {
 	// Update router buckets for remote site; no COI shm (local only)
-	log.Printf("pigeon (%d): router learned site=%d %d ent(s) via op=%d", p.siteID, siteID, len(ents), op)
+	// log.Printf("pigeon (%d): router learned site=%d %d ent(s) via op=%d", p.siteID, siteID, len(ents), op)
 	p.mu.Lock()
 	for _, e := range ents {
 		switch op {
@@ -394,7 +394,7 @@ func (p *Pigeon) handleFragControl(c net.Conn) {
 			p.publishCOIShm()
 			// enqueue gossip DEL...
 		}
-		log.Printf("pigeon (%d): %s %d entries", p.siteID, map[byte]string{opREGISTER: "REGISTER", opRENEW: "RENEW", opUNREG: "UNREG"}[op], cnt)
+		//log.Printf("pigeon (%d): %s %d entries", p.siteID, map[byte]string{opREGISTER: "REGISTER", opRENEW: "RENEW", opUNREG: "UNREG"}[op], cnt)
 	}
 }
 
