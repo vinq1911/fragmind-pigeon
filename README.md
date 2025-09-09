@@ -3,6 +3,8 @@
 COI-aware, ultra-fast IPC + cluster routing for fragmind fragments.
 Local delivery via shared-memory SPSC rings; cross-host via pigeons.
 
+Work in progress, be patient
+
 ## Install
 
 ```bash
