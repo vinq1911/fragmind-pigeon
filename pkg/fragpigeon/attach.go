@@ -142,36 +142,28 @@ func createRingFD(dir, name string, capSlots, slotSize int) (int, error) {
 }
 
 // sendFDs sends file descriptors over a Unix domain socket using SCM_RIGHTS.
+// Uses Go's native UnixConn.WriteMsgUnix to avoid File() dup issues.
 func sendFDs(conn net.Conn, fds []int, data []byte) error {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
 		return fmt.Errorf("not a unix conn")
 	}
-	f, err := uc.File()
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
 	rights := unix.UnixRights(fds...)
-	return unix.Sendmsg(int(f.Fd()), data, rights, nil, 0)
+	_, _, err := uc.WriteMsgUnix(data, rights, nil)
+	return err
 }
 
 // recvFDs receives file descriptors from a Unix domain socket.
+// Uses Go's native UnixConn.ReadMsgUnix to avoid File() dup issues.
 func recvFDs(conn net.Conn, numFDs int) ([]int, []byte, error) {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
 		return nil, nil, fmt.Errorf("not a unix conn")
 	}
-	f, err := uc.File()
-	if err != nil {
-		return nil, nil, err
-	}
-	defer f.Close()
 
 	buf := make([]byte, 64)
 	oob := make([]byte, unix.CmsgLen(numFDs*4))
-	n, oobn, _, _, err := unix.Recvmsg(int(f.Fd()), buf, oob, 0)
+	n, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -199,7 +191,7 @@ func (p *Pigeon) handleAttach(c net.Conn) {
 
 	dir := os.TempDir()
 	capSlots := 1024
-	slotSize := HdrSize + LOARefSize + 16 // enough for LOA pointer messages
+	slotSize := 1024 // 64B header + up to 960B payload (or LOA pointers)
 
 	inRing, inFD, outRing, outFD, err := createRingPair(dir, fragID, capSlots, slotSize)
 	if err != nil {

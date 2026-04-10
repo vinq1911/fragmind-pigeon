@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fragpigeon"
+version = "0.1.0"
+description = "Python bindings for fragmind-pigeon shared-memory IPC"
+readme = "../../README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "vinq1911"},
+]
+keywords = ["ipc", "shared-memory", "llm", "inference", "zero-copy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.24"]
+torch = ["torch>=2.0"]
+test = ["pytest>=7.0"]
+
+[tool.setuptools]
+py-modules = ["fragpigeon", "fragpigeon_numpy"]

@@ -352,11 +352,17 @@ class LOAPool:
         return cls(mm, total_size)
 
     def close(self):
-        # Release any outstanding memoryviews before closing mmap
+        # Release tracked memoryviews
         for v in self._views:
-            v.release()
+            try:
+                v.release()
+            except ValueError:
+                pass
         self._views.clear()
-        self._mm.close()
+        try:
+            self._mm.close()
+        except BufferError:
+            pass  # numpy/torch may hold derived buffer refs; gc cleans up
 
     def _meta_offset(self, slot_id: int) -> int:
         return LOA_HEADER_SIZE + slot_id * LOA_SLOT_META_SIZE

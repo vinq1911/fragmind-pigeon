@@ -1094,3 +1094,170 @@ func TestE2E_LOARouting(t *testing.T) {
 
 	t.Log("LOA routing: A writes LOA → pigeon → B reads zero-copy = PASS")
 }
+
+// ================================================================
+// E2E Test 20: Attach() over real UDS with SCM_RIGHTS FD passing
+// ================================================================
+
+func TestE2E_AttachSCMRights(t *testing.T) {
+	dir := t.TempDir()
+	sock := fmt.Sprintf("/tmp/fp-test-attach-%d.sock", time.Now().UnixNano()%100000)
+	defer os.Remove(sock)
+	coiPath := filepath.Join(dir, "fragmind.coi.local")
+	loaPath := filepath.Join(dir, "fragmind.loa.1")
+
+	t.Setenv(COIShmEnv, coiPath)
+	t.Setenv(LOAShmEnv, loaPath)
+
+	// Start pigeon daemon
+	p := NewPigeon(1, sock)
+	if err := p.initCOIShm(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.initLOAPool(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.serveUDS(); err != nil {
+		t.Fatal(err)
+	}
+	go p.housekeep()
+	time.Sleep(50 * time.Millisecond)
+
+	// Fragment attaches over real UDS
+	att, err := Attach(sock)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer att.Close()
+
+	if att.FragID == 0 {
+		t.Fatal("expected non-zero FragID")
+	}
+	t.Logf("attached: fragID=%d", att.FragID)
+
+	// Write to outbound ring
+	payload := testPayload(64)
+	hdr := testHeader(64, 1)
+	if !att.OutRing.TryWrite(hdr, payload) {
+		t.Fatal("outbound write failed")
+	}
+
+	// Read back from outbound ring (pigeon hasn't read it yet, so it's there)
+	// Actually the routing goroutine started by handleAttach reads it.
+	// Let's verify the ring is functional by writing+reading on inbound.
+	hdr2 := testHeader(32, 2)
+	inPayload := testPayload(32)
+
+	// Pigeon can write to the fragment's inbound ring
+	frag := p.frags.get(att.FragID)
+	if frag == nil {
+		t.Fatal("fragment not registered in pigeon")
+	}
+	if !frag.InRing.TryWrite(hdr2, inPayload) {
+		t.Fatal("pigeon write to inbound ring failed")
+	}
+
+	// Fragment reads from its inbound ring
+	msg, err := att.InRing.ReadWithin(2 * time.Second)
+	if err != nil {
+		t.Fatalf("inbound read: %v", err)
+	}
+	if msg.Header.MsgID != 2 {
+		t.Fatalf("expected MsgID=2, got %d", msg.Header.MsgID)
+	}
+	if !verifyPayload(msg.Payload) {
+		t.Fatal("inbound payload CRC mismatch")
+	}
+
+	t.Log("SCM_RIGHTS attach: PASS (FD passing + bidirectional ring)")
+}
+
+// ================================================================
+// E2E Test 21: Two fragments attach, route messages via pigeon
+// ================================================================
+
+func TestE2E_TwoFragmentsAttachAndRoute(t *testing.T) {
+	dir := t.TempDir()
+	sock := fmt.Sprintf("/tmp/fp-test-2frag-%d.sock", time.Now().UnixNano()%100000)
+	defer os.Remove(sock)
+	coiPath := filepath.Join(dir, "fragmind.coi.local")
+	loaPath := filepath.Join(dir, "fragmind.loa.1")
+
+	t.Setenv(COIShmEnv, coiPath)
+	t.Setenv(LOAShmEnv, loaPath)
+
+	p := NewPigeon(1, sock)
+	if err := p.initCOIShm(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.initLOAPool(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.serveUDS(); err != nil {
+		t.Fatal(err)
+	}
+	go p.housekeep()
+	time.Sleep(50 * time.Millisecond)
+
+	// Fragment A attaches
+	attA, err := Attach(sock)
+	if err != nil {
+		t.Fatalf("Attach A: %v", err)
+	}
+	defer attA.Close()
+
+	// Fragment B attaches
+	attB, err := Attach(sock)
+	if err != nil {
+		t.Fatalf("Attach B: %v", err)
+	}
+	defer attB.Close()
+
+	t.Logf("A=%d B=%d", attA.FragID, attB.FragID)
+
+	// Register B's COI so A's messages route to B
+	conceptID := uint64(0x00CC000000000000)
+	coisB, err := StartCOI(COIOptions{
+		SocketPath: sock,
+		FragID:     uint16(attB.FragID),
+	}, []COI{{ConceptID: conceptID, Bits: 16, SchemaID: SchemaWeightShard}})
+	if err != nil {
+		t.Fatalf("B COI register: %v", err)
+	}
+	defer coisB.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// A sends a message targeting B's COI
+	payload := testPayload(128)
+	hdr := Header{
+		Len:         uint32(len(payload)),
+		Kind:        KindProcess,
+		TSns:        uint64(time.Now().UnixNano()),
+		ConceptID:   conceptID,
+		ConceptBits: 16,
+		SchemaID:    SchemaWeightShard,
+		SrcID:       attA.FragID,
+		MsgID:       77,
+		Ver:         1,
+	}
+	if !attA.OutRing.TryWrite(hdr, payload) {
+		t.Fatal("A outbound write failed")
+	}
+
+	// B should receive it on its inbound ring
+	msg, err := attB.InRing.ReadWithin(3 * time.Second)
+	if err != nil {
+		t.Fatalf("B read: %v", err)
+	}
+	if msg.Header.MsgID != 77 {
+		t.Fatalf("expected MsgID=77, got %d", msg.Header.MsgID)
+	}
+	if msg.Header.SrcID != attA.FragID {
+		t.Fatalf("expected SrcID=%d, got %d", attA.FragID, msg.Header.SrcID)
+	}
+	if !verifyPayload(msg.Payload) {
+		t.Fatal("payload CRC mismatch")
+	}
+
+	t.Log("two-fragment attach+route: A → pigeon → B via Attach() = PASS")
+}
