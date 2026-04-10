@@ -180,6 +180,9 @@ FM_SITE_ID=1 FM_PIGEON_SOCK=/tmp/pigeon.sock ./pigeon
 | `FM_BIND` | `:4433` | QUIC listen address |
 | `FM_PEERS` | (empty) | Comma-separated peer addresses |
 | `FM_COI_SHM_PATH` | `/dev/shm/fragmind.coi.local` (Linux) | COI shared-memory path |
+| `FM_LOA_SHM_PATH` | `/dev/shm/fragmind.loa.<siteID>` | LOA pool path |
+| `FM_LOA_SLOTS` | `4096` | Number of LOA slots |
+| `FM_LOA_SLOT_SIZE` | `65536` | Bytes per LOA slot |
 
 ### Multi-Pigeon Cluster
 
@@ -279,6 +282,67 @@ for _, e := range entries {
 }
 ```
 
+### Fragment Attachment (Pigeon-Managed Routing)
+
+```go
+// Fragment attaches to pigeon — receives ring pair for routed messaging
+att, _ := fp.Attach("/tmp/pigeon.sock")
+defer att.Close()
+
+// Register COIs so other fragments' messages get routed to you
+cois := []fp.COI{{ConceptID: 0x0001000000000000, Bits: 16, SchemaID: fp.SchemaWeightShard}}
+h, _ := fp.StartCOI(fp.COIOptions{
+    SocketPath: "/tmp/pigeon.sock",
+    FragID:     uint16(att.FragID),
+}, cois)
+defer h.Close()
+
+// Write to your outbound ring — pigeon routes to subscribers
+hdr := fp.Header{Kind: fp.KindProcess, ConceptID: 0x0001000000000000, ConceptBits: 16}
+att.OutRing.TryWrite(hdr, payload)
+
+// Read from your inbound ring — messages routed to you by pigeon
+msg, _ := att.InRing.ReadWithin(time.Second)
+```
+
+### Backpressure
+
+```go
+// Write with exponential backoff (blocks up to timeout)
+err := fp.RingWriteWithBackoff(ring, hdr, payload, 5*time.Second)
+
+// LOA alloc with retry on pool-full
+buf, ref, err := fp.LOAAllocWithBackoff(pool, size, fragID, 5*time.Second)
+
+// Full LOA write path with backpressure on both pool and ring
+ref, err := fp.WriteLOAWithBackoff(ring, pool, hdr, data, fragID, 5*time.Second)
+
+// FlagDropOK: if ring is still full at deadline, message is dropped (not an error)
+hdr.Flags |= fp.FlagDropOK
+err = fp.RingWriteWithBackoff(ring, hdr, payload, 100*time.Millisecond)
+// err == fp.ErrDropped means safe drop, not a failure
+```
+
+### Python Bindings
+
+```python
+from fragpigeon import Ring, LOAPool, Header, write_loa, read_loa
+
+# Open ring and LOA pool (same shm files the Go pigeon creates)
+ring = Ring.from_path("/dev/shm/my-ring.shm")
+pool = LOAPool.open("/dev/shm/fragmind.loa.1")
+
+# Write a weight shard via LOA
+ref = write_loa(ring, pool, header, tensor_bytes, owner_frag_id=1)
+
+# Read and deref
+msg, data, ref = read_loa(ring, pool, timeout_s=1.0)
+tensor = np.frombuffer(data, dtype=np.float16)
+pool.release(ref)
+```
+
+See [docs/python-bindings.md](docs/python-bindings.md) for full API reference.
+
 ## Performance
 
 Benchmarked on Apple M4 (ARM64):
@@ -293,6 +357,28 @@ Benchmarked on Apple M4 (ARM64):
 | Schema meta encode + decode | ~2 ns | 0 |
 
 All hot paths are zero-allocation.
+
+### Comparative (end-to-end, Apple M4)
+
+**Small messages (P50 latency, lower = better):**
+
+| Transport | 64B | 1KB |
+|-----------|-----|-----|
+| **fragmind-ring** | **167 ns** | **208 ns** |
+| UDS | 2,959 ns (18x) | 3,250 ns (16x) |
+| Pipe | 2,792 ns (17x) | 3,042 ns (15x) |
+| TCP | 10,333 ns (62x) | 10,208 ns (49x) |
+
+**Large objects (throughput MB/s, higher = better):**
+
+| Transport | 64KB | 1MB | 16MB |
+|-----------|------|-----|------|
+| **fragmind-loa** | **9,369** | **8,950** | **8,455** |
+| TCP | 1,483 | 4,952 | 4,920 |
+| Pipe | 3,708 | 3,771 | 3,275 |
+| UDS | 1,888 | 2,696 | 2,459 |
+
+Run `bash proof/run.sh` to reproduce. Results saved to `proof/results/` as JSON for tracking over time.
 
 ## Build
 
@@ -347,32 +433,58 @@ go test -bench=. -benchmem ./pkg/fragpigeon/
 ## Project Structure
 
 ```
-cmd/pigeon/             Pigeon daemon entry point
+cmd/pigeon/              Pigeon daemon entry point
 pkg/fragpigeon/
-  pigeon.go             Pigeon daemon core (COI shm, UDS server, gossip)
-  ring.go               SPSC shared-memory ring buffer
-  header.go             64-byte message header (pack/unpack)
-  coi.go                COI client, COI table reader, auto-renew handle
-  router.go             Concept-based routing table
-  loa.go                LOA shared-memory arena (alloc/commit/deref/release)
-  loa_ring.go           LOA + Ring integration helpers
-  schema.go             LLM schema definitions (weight, KV-cache, activation, etc.)
-  peers.go              PeerManager interface
-  peers_quic.go         QUIC peer manager (build tag: quic)
-  peers_stub.go         No-op peer manager (default)
-  gossip_quic.go        Gossip protocol + QUIC dialer (build tag: quic)
-  gossip_stub.go        Gossip stubs (default)
-  forward_quic.go       Cross-host message forwarding (build tag: quic)
-  defaults_*.go         Platform-specific defaults (Linux/macOS paths)
+  pigeon.go              Daemon core (COI shm, LOA pool, UDS server, gossip)
+  ring.go                SPSC shared-memory ring buffer (atomic, ARM64-safe)
+  header.go              64-byte message header (pack/unpack)
+  coi.go                 COI client, table reader, auto-renew, LOA discovery
+  router.go              Concept-based routing table
+  loa.go                 LOA shared-memory arena (alloc/commit/deref/release)
+  loa_multi.go           Multi-slot LOA for large payloads
+  loa_ring.go            LOA + Ring integration helpers
+  attach.go              Fragment attachment, ring pair creation, COI routing
+  backpressure.go        Exponential backoff for ring + LOA writes
+  schema.go              LLM schemas (WeightShard, KVCache, Activation, etc.)
+  peers.go               PeerManager interface
+  peers_quic.go          QUIC peer manager (build tag: quic)
+  gossip_quic.go         Gossip protocol (build tag: quic)
+  forward_quic.go        Cross-host forwarding with LOA resolution (build tag: quic)
+  *_stub.go              No-op stubs for non-QUIC builds
+  defaults_*.go          Platform-specific paths (Linux /dev/shm, macOS /tmp)
+  e2e_test.go            19 end-to-end integration tests
+  *_test.go              Unit tests and benchmarks
   internal/
-    memfd_linux.go      memfd_create for anonymous shm
-    memfd_other_unix.go Temp-file fallback for macOS/BSD
+    memfd_linux.go       memfd_create for anonymous shm
+    memfd_other_unix.go  Temp-file fallback for macOS/BSD
+bindings/
+  c/fragpigeon.h         C header — all struct definitions + inline helpers
+  python/
+    fragpigeon.py        Pure Python bindings (mmap + struct, no extensions)
+    test_fragpigeon.py   22 unit tests
+    test_cross_language.py  Python-writes-Go-reads interop tests
+proof/
+  proof_test.go          Comparative benchmark suite (fragmind vs baselines)
+  harness.go             Payload gen, latency histogram, JSON reporting
+  fragmind.go            Ring + LOA benchmark wrappers
+  baselines.go           UDS, TCP, Pipe transports (end-to-end)
+  run.sh                 One-command benchmark runner
+  results/               JSON results (gitignored, machine-specific)
 examples/
-  local_ring_demo/      Coordinator + sender + receiver over shared rings
-  coi_register/         Register COIs with a running pigeon
-  coi_list/             List COIs via UDS
-  coi_watch/            Watch COI shm table for changes
-  coi_dump/             Dump COI shm table
+  loa_weight_demo/       Zero-copy weight shard transfer demo
+  local_ring_demo/       Coordinator + sender + receiver over shared rings
   scripts/
-    two_pigeons_local.sh  Launch a 3-pigeon QUIC cluster locally
+    two_pigeons_local.sh Launch a 3-pigeon QUIC cluster locally
+docs/
+  architecture.md        System design, message flow, memory layouts
+  wire-protocol.md       Binary protocol reference (UDS, gossip, shm layouts)
+  python-bindings.md     Python API reference and usage guide
+  testing.md             Test structure, coverage, and patterns
 ```
+
+## Documentation
+
+- [Architecture](docs/architecture.md) — system design, message flow, concurrency model
+- [Wire Protocol](docs/wire-protocol.md) — binary format reference for all protocols
+- [Python Bindings](docs/python-bindings.md) — API reference and usage guide
+- [Testing Guide](docs/testing.md) — test structure, coverage, how to write new tests
