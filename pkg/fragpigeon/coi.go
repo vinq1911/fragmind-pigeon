@@ -29,9 +29,10 @@ type COI struct {
 /******** Fragment <-> Pigeon UDS control ********/
 
 type coiClient struct {
-	mu  sync.Mutex
-	c   net.Conn
-	buf []byte
+	mu     sync.Mutex
+	c      net.Conn
+	buf    []byte
+	fragID uint16 // set after Attach; included in REGISTER/RENEW headers
 }
 
 func newCOIClient(sockPath string) (*coiClient, error) {
@@ -50,6 +51,7 @@ const (
 	opRENEW    = 1
 	opUNREG    = 2
 	opLIST     = 3
+	opLOAINFO  = 4 // query LOA pool path
 )
 
 func (cc *coiClient) send(op byte, set []COI) error {
@@ -62,7 +64,7 @@ func (cc *coiClient) send(op byte, set []COI) error {
 	b := cc.buf[:n]
 	b[0] = op
 	b[1] = byte(len(set))
-	b[2], b[3] = 0, 0
+	binary.LittleEndian.PutUint16(b[2:4], cc.fragID)
 	off := 4
 	for _, s := range set {
 		binary.LittleEndian.PutUint64(b[off+0:], s.ConceptID)
@@ -188,6 +190,7 @@ type COIHandle struct {
 type COIOptions struct {
 	SocketPath string
 	RenewEvery time.Duration // default 1s
+	FragID     uint16        // fragment ID (from Attach); 0 if not attached
 }
 
 func StartCOI(opts COIOptions, initial []COI) (*COIHandle, error) {
@@ -198,6 +201,7 @@ func StartCOI(opts COIOptions, initial []COI) (*COIHandle, error) {
 	if err != nil {
 		return nil, err
 	}
+	cc.fragID = opts.FragID
 	h := &COIHandle{cc: cc, stop: make(chan struct{}, 1)}
 	if len(initial) > 0 {
 		if err := cc.Register(initial); err != nil {
@@ -262,6 +266,46 @@ func (cc *coiClient) List() ([]COI, error) {
 		off += 16
 	}
 	return out, nil
+}
+
+// LOAInfo queries the local pigeon for its LOA pool shm path.
+func (cc *coiClient) LOAInfo() (string, error) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	var hdr [4]byte
+	hdr[0] = opLOAINFO
+	if _, err := cc.c.Write(hdr[:]); err != nil {
+		return "", err
+	}
+	// Reply: [u16 pathLen][path bytes]
+	buf := make([]byte, 1024)
+	n, err := cc.c.Read(buf)
+	if err != nil || n < 2 {
+		return "", errors.New("short read on LOAINFO")
+	}
+	pathLen := int(binary.LittleEndian.Uint16(buf[:2]))
+	if 2+pathLen > n {
+		return "", errors.New("truncated LOAINFO reply")
+	}
+	return string(buf[2 : 2+pathLen]), nil
+}
+
+// DiscoverLOAPool connects to the local pigeon, queries the LOA pool path,
+// and opens it. Returns the pool handle for alloc/deref/release.
+func DiscoverLOAPool(socketPath string) (*LOAPool, error) {
+	cc, err := newCOIClient(socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("connect to pigeon: %w", err)
+	}
+	defer cc.c.Close()
+	path, err := cc.LOAInfo()
+	if err != nil {
+		return nil, fmt.Errorf("query LOA info: %w", err)
+	}
+	if path == "" {
+		return nil, errors.New("pigeon has no LOA pool")
+	}
+	return OpenLOAPool(path)
 }
 
 func (h *COIHandle) Close() error {

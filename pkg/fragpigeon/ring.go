@@ -2,6 +2,7 @@ package fragpigeon
 
 import (
 	"errors"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -55,8 +56,8 @@ type Msg struct {
 }
 
 func (r *Ring) TryWrite(h Header, payload []byte) bool {
-	prod := load64(&r.ctrl.ProdIdx)
-	cons := load64(&r.ctrl.ConsIdx)
+	prod := atomic.LoadUint64(&r.ctrl.ProdIdx)
+	cons := atomic.LoadUint64(&r.ctrl.ConsIdx)
 	if prod-cons >= r.ctrl.CapSlots {
 		return false
 	} // full
@@ -67,15 +68,15 @@ func (r *Ring) TryWrite(h Header, payload []byte) bool {
 	h.Pack(unsafe.Pointer(slot))
 	ps := unsafe.Slice((*byte)(unsafe.Pointer(slot+HdrSize)), int(h.Len))
 	copy(ps, payload)
-	store64(&r.ctrl.ProdIdx, prod+1)
+	atomic.StoreUint64(&r.ctrl.ProdIdx, prod+1)
 	_, _ = unix.Write(int(r.ctrl.ConsEvtFD), []byte{1, 0, 0, 0, 0, 0, 0, 0})
 	return true
 }
 
 func (r *Ring) Read(block bool) (Msg, error) {
 	for {
-		prod := load64(&r.ctrl.ProdIdx)
-		cons := load64(&r.ctrl.ConsIdx)
+		prod := atomic.LoadUint64(&r.ctrl.ProdIdx)
+		cons := atomic.LoadUint64(&r.ctrl.ConsIdx)
 		if prod == cons {
 			if !block {
 				return Msg{}, unix.EAGAIN
@@ -91,7 +92,7 @@ func (r *Ring) Read(block bool) (Msg, error) {
 		slot := r.slotPtr(cons)
 		h := UnpackHeader(unsafe.Pointer(slot))
 		p := unsafe.Slice((*byte)(unsafe.Pointer(slot+HdrSize)), int(h.Len))
-		store64(&r.ctrl.ConsIdx, cons+1)
+		atomic.StoreUint64(&r.ctrl.ConsIdx, cons+1)
 		return Msg{Header: h, Payload: p}, nil
 	}
 }
@@ -113,5 +114,3 @@ func (r *Ring) ReadWithin(d time.Duration) (Msg, error) {
 	}
 }
 
-func load64(p *uint64) uint64     { return *(*uint64)(unsafe.Pointer(p)) }
-func store64(p *uint64, v uint64) { *(*uint64)(unsafe.Pointer(p)) = v }

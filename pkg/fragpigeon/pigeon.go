@@ -3,11 +3,13 @@ package fragpigeon
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -38,12 +40,19 @@ type Pigeon struct {
 	shmMem  []byte
 	udsPath string
 
+	// LOA pool
+	loaPool *LOAPool
+	loaPath string
+
+	// Fragment registry (attached fragments with ring pairs)
+	frags *fragmentRegistry
+
 	// --- peers ---
 	mode       string      // "quic" or "none"
 	bind       string      // e.g., ":4433"
 	peers      []string    // dial targets
 	pm         PeerManager // interface (quic or stub)
-	epoch      uint32
+	epoch      atomic.Uint32
 	debouncing bool
 	debounceMu sync.Mutex
 	// gossip queues (protected by mu)
@@ -60,6 +69,7 @@ func NewPigeon(siteID uint16, udsPath string) *Pigeon {
 		router:  NewRouter(),
 		local:   make(map[uint64]LocalCOI),
 		udsPath: udsPath,
+		frags:   newFragmentRegistry(),
 	}
 }
 
@@ -72,6 +82,7 @@ func NewPigeonWithNet(siteID uint16, udsPath, mode, bind string, peers []string)
 		router:  NewRouter(),
 		local:   make(map[uint64]LocalCOI),
 		udsPath: udsPath,
+		frags:   newFragmentRegistry(),
 		mode:    mode,
 		bind:    bind,
 		peers:   peers,
@@ -101,12 +112,17 @@ func (p *Pigeon) Run() error {
 	}
 	p.publishCOIShm() // initialize version/updated once so watchers see non-zero header
 
-	// 2) UDS server (REGISTER/RENEW/UNREGISTER)
+	// 2) LOA pool
+	if err := p.initLOAPool(); err != nil {
+		return err
+	}
+
+	// 3) UDS server (REGISTER/RENEW/UNREGISTER)
 	if err := p.serveUDS(); err != nil {
 		return err
 	}
 
-	// 3) leases & gossip debounce
+	// 4) leases & gossip debounce
 	go p.housekeep()
 
 	select {}
@@ -272,11 +288,13 @@ func (p *Pigeon) flushGossip() {
 	p.mu.Unlock()
 
 	// broadcast (best-effort)
-	if len(adds) > 0 {
-		p.pm.Broadcast(ctlADD, adds)
-	}
-	if len(dels) > 0 {
-		p.pm.Broadcast(ctlDEL, dels)
+	if p.pm != nil {
+		if len(adds) > 0 {
+			p.pm.Broadcast(ctlADD, adds)
+		}
+		if len(dels) > 0 {
+			p.pm.Broadcast(ctlDEL, dels)
+		}
 	}
 
 	p.debounceMu.Lock()
@@ -316,23 +334,34 @@ func (p *Pigeon) serveUDS() error {
 
 func (p *Pigeon) handleFragControl(c net.Conn) {
 	defer c.Close()
-	buf := make([]byte, 1024)
+	hdr := make([]byte, 4)
 	for {
-		n, err := c.Read(buf)
-		if err != nil || n < 4 {
+		// Read the fixed 4-byte header reliably
+		if _, err := io.ReadFull(c, hdr); err != nil {
 			return
 		}
-		op := buf[0]
-		cnt := int(buf[1])
-		off := 4
+		op := hdr[0]
+		cnt := int(hdr[1])
+
+		// Read the entry payload (cnt * 16 bytes) if any
+		payloadLen := cnt * 16
+		var buf []byte
+		if payloadLen > 0 {
+			buf = make([]byte, payloadLen)
+			if _, err := io.ReadFull(c, buf); err != nil {
+				return
+			}
+		}
 
 		switch op {
 		case opREGISTER, opRENEW:
 			now := time.Now()
-			// Build gossip entries
 			ents := make([]GossipEntry, 0, cnt)
+			// Extract fragID from header byte 2-3 (if fragment provided it)
+			fragID := leU16(hdr[2:])
 			p.mu.Lock()
-			for i := 0; i < cnt && off+16 <= n; i++ {
+			for i := 0; i < cnt; i++ {
+				off := i * 16
 				cid := leU64(buf[off:])
 				bits := leU16(buf[off+8:])
 				schema := leU16(buf[off+10:])
@@ -340,22 +369,21 @@ func (p *Pigeon) handleFragControl(c net.Conn) {
 				k := key(bits, cid)
 				p.local[k] = LocalCOI{
 					COI:        COI{ConceptID: cid, Bits: bits, SchemaID: schema, Flags: flags},
-					LeaseUntil: now.Add(LeaseTTL),
-					GraceUntil: now.Add(LeaseTTL + BlackoutGrace),
+					OwnerFragID: uint32(fragID),
+					LeaseUntil:  now.Add(LeaseTTL),
+					GraceUntil:  now.Add(LeaseTTL + BlackoutGrace),
 				}
-				off += 16
 				ents = append(ents, GossipEntry{ConceptID: cid, Bits: bits, SchemaID: schema, Flags: flags})
-
+				// Register in router for local delivery
+				if fragID > 0 {
+					p.router.Add(bits, cid, []uint16{fragID}, nil)
+				}
 			}
 			p.mu.Unlock()
 			p.enqueueGossipAdds(ents)
-
 			p.publishCOIShm()
 
-			// enqueue gossip ADD/RENEW (debounced)...
-
 		case opLIST:
-			// snapshot local table and reply
 			p.mu.RLock()
 			tmp := make([]LocalCOI, 0, len(p.local))
 			for _, v := range p.local {
@@ -363,7 +391,6 @@ func (p *Pigeon) handleFragControl(c net.Conn) {
 			}
 			p.mu.RUnlock()
 
-			// encode: [u16 count][entries...]
 			resp := make([]byte, 2+len(tmp)*16)
 			binary.LittleEndian.PutUint16(resp[:2], uint16(len(tmp)))
 			off := 2
@@ -375,28 +402,80 @@ func (p *Pigeon) handleFragControl(c net.Conn) {
 				off += 16
 			}
 			_, _ = c.Write(resp)
+
 		case opUNREG:
 			ents := make([]GossipEntry, 0, cnt)
 			p.mu.Lock()
-			for i := 0; i < cnt && off+16 <= n; i++ {
+			for i := 0; i < cnt; i++ {
+				off := i * 16
 				cid := leU64(buf[off:])
 				bits := leU16(buf[off+8:])
 				schema := leU16(buf[off+10:])
 				flags := leU16(buf[off+12:])
 				k := key(bits, cid)
 				delete(p.local, k)
-				off += 16
 				ents = append(ents, GossipEntry{ConceptID: cid, Bits: bits, SchemaID: schema, Flags: flags})
-
 			}
 			p.mu.Unlock()
 			p.enqueueGossipDels(ents)
 			p.publishCOIShm()
-			// enqueue gossip DEL...
+
+		case opLOAINFO:
+			// Reply with LOA pool path: [u16 len][path bytes]
+			pathBytes := []byte(p.loaPath)
+			resp := make([]byte, 2+len(pathBytes))
+			binary.LittleEndian.PutUint16(resp[:2], uint16(len(pathBytes)))
+			copy(resp[2:], pathBytes)
+			_, _ = c.Write(resp)
+
+		case opATTACH:
+			p.handleAttach(c)
+			return // attachment takes over the connection lifecycle
 		}
-		//log.Printf("pigeon (%d): %s %d entries", p.siteID, map[byte]string{opREGISTER: "REGISTER", opRENEW: "RENEW", opUNREG: "UNREG"}[op], cnt)
 	}
 }
+
+const LOAShmEnv = "FM_LOA_SHM_PATH"
+
+func (p *Pigeon) initLOAPool() error {
+	path := os.Getenv(LOAShmEnv)
+	if path == "" {
+		path = filepath.Join(defaultLOADir(), fmt.Sprintf("fragmind.loa.%d", p.siteID))
+	}
+
+	numSlots := uint32(DefaultLOASlots)
+	slotSize := uint32(DefaultLOASlotSize)
+	if s := os.Getenv("FM_LOA_SLOTS"); s != "" {
+		if v, err := fmt.Sscanf(s, "%d", &numSlots); err != nil || v != 1 {
+			numSlots = DefaultLOASlots
+		}
+	}
+	if s := os.Getenv("FM_LOA_SLOT_SIZE"); s != "" {
+		if v, err := fmt.Sscanf(s, "%d", &slotSize); err != nil || v != 1 {
+			slotSize = DefaultLOASlotSize
+		}
+	}
+
+	pool, err := CreateLOAPool(LOAPoolOptions{
+		Path:     path,
+		PoolID:   p.siteID,
+		NumSlots: numSlots,
+		SlotSize: slotSize,
+	})
+	if err != nil {
+		return fmt.Errorf("init LOA pool: %w", err)
+	}
+	p.loaPool = pool
+	p.loaPath = path
+	log.Printf("pigeon (%d): LOA pool at %s (slots=%d slotSize=%d)", p.siteID, path, numSlots, slotSize)
+	return nil
+}
+
+// LOAPool returns the pigeon's LOA pool (for in-process use / tests).
+func (p *Pigeon) LOAPool() *LOAPool { return p.loaPool }
+
+// LOAPath returns the shm path of the LOA pool.
+func (p *Pigeon) LOAPath() string { return p.loaPath }
 
 func leU64(b []byte) uint64 {
 	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 | uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56

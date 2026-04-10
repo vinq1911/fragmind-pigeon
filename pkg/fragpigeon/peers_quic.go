@@ -115,9 +115,10 @@ func (c qConn) CloseWithAppError(code uint64, msg string) error {
 
 /*** peer manager using connLike/streamLike ***/
 type quicPeers struct {
-	p     *Pigeon
-	mu    sync.RWMutex
-	conns map[uint16]connLike // siteID -> conn
+	p         *Pigeon
+	mu        sync.RWMutex
+	conns     map[uint16]connLike // siteID -> conn
+	pendingID uint16              // monotonic counter for pre-HELLO connections (starts at 0xF000)
 }
 
 func (qp *quicPeers) Start(p *Pigeon) error {
@@ -183,14 +184,17 @@ func (qp *quicPeers) attachConn(c connLike) {
 	go qp.acceptReadLoop(c) // IMPORTANT: accept peer's streams
 
 	if str, err := c.OpenStreamSync(context.Background()); err == nil {
-		//n (%d): quic connected to peer", qp.p.siteID)
 		qp.sendHello(str)
 		qp.sendSnapshot(str)
 		_ = str.Close()
 	}
 
+	// Assign a unique pending key (0xF000+) to avoid clobbering concurrent connections.
+	// Real siteIDs are small (1..N), so these won't collide. Replaced by real siteID on HELLO.
 	qp.mu.Lock()
-	qp.conns[0] = c // temporary until we learn siteID from HELLO
+	qp.pendingID++
+	tmpKey := 0xF000 + qp.pendingID
+	qp.conns[tmpKey] = c
 	qp.mu.Unlock()
 }
 
@@ -249,7 +253,13 @@ func (qp *quicPeers) handleControlFrames(c connLike, b []byte) {
 		switch op {
 		case ctlHELLO:
 			qp.mu.Lock()
-			delete(qp.conns, 0)
+			// Remove any pending key that maps to this connection
+			for k, v := range qp.conns {
+				if k >= 0xF000 && v == c {
+					delete(qp.conns, k)
+					break
+				}
+			}
 			qp.conns[site] = c
 			qp.mu.Unlock()
 			if str, err := c.OpenStreamSync(context.Background()); err == nil {
@@ -292,11 +302,11 @@ func (qp *quicPeers) Close() error {
 }
 
 func (qp *quicPeers) sendHello(str streamLike) {
-	qp.p.epoch++
+	e := qp.p.epoch.Add(1)
 	var b [8]byte
 	b[0], b[1] = ctlHELLO, 0
 	binary.LittleEndian.PutUint16(b[2:], qp.p.siteID)
-	binary.LittleEndian.PutUint32(b[4:], qp.p.epoch)
+	binary.LittleEndian.PutUint32(b[4:], e)
 	_, _ = str.Write(b[:])
 }
 
@@ -306,7 +316,7 @@ func (qp *quicPeers) sendSnapshot(str streamLike) {
 	_, _ = str.Write(f)
 }
 
-func (qp *quicPeers) bumpEpoch() uint32 { qp.p.epoch++; return qp.p.epoch }
+func (qp *quicPeers) bumpEpoch() uint32 { return qp.p.epoch.Add(1) }
 
 func opFrame(op byte, site uint16, epoch uint32, ents []GossipEntry) []byte {
 	n := 8 + len(ents)*16

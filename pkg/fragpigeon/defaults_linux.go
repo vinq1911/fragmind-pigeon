@@ -3,3 +3,5 @@
 package fragpigeon
 
 const DefaultCOIShmPath = "/dev/shm/fragmind.coi.local"
+
+func defaultLOADir() string { return "/dev/shm" }
