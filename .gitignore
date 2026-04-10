@@ -4,3 +4,4 @@
 
 # Proof benchmark results (machine-specific)
 proof/results/*.json
+__pycache__/
