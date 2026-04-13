@@ -1,4 +1,4 @@
-//go:build !quic
+//go:build !quic && !rdma
 
 package fragpigeon
 

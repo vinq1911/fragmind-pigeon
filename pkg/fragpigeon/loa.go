@@ -242,6 +242,15 @@ func OpenLOAPool(path string) (*LOAPool, error) {
 	return pool, nil
 }
 
+// Mem returns the raw mmap'd memory (for RDMA memory registration).
+func (p *LOAPool) Mem() []byte { return p.mem }
+
+// DataBase returns the byte offset where slot data begins.
+func (p *LOAPool) DataBase() uint32 { return p.hdr.DataBase }
+
+// SlotSize returns bytes per slot.
+func (p *LOAPool) SlotSize() uint32 { return p.slotSize }
+
 func (p *LOAPool) Close() error {
 	if err := unix.Munmap(p.mem); err != nil {
 		return err

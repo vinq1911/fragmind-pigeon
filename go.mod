@@ -1,8 +1,6 @@
 module github.com/vinq1911/fragmind-pigeon
 
-go 1.24.0
-
-toolchain go1.24.7
+go 1.26.0
 
 require (
 	github.com/quic-go/quic-go v0.54.0
@@ -10,6 +8,7 @@ require (
 )
 
 require (
+	github.com/vinq1911/gorch v0.0.0-20260410091737-555237f03343 // indirect
 	go.uber.org/mock v0.5.0 // indirect
 	golang.org/x/crypto v0.26.0 // indirect
 	golang.org/x/mod v0.18.0 // indirect
