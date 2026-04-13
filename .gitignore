@@ -5,3 +5,4 @@
 # Proof benchmark results (machine-specific)
 proof/results/*.json
 __pycache__/
+/gorch_distributed
