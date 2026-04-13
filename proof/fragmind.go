@@ -9,53 +9,11 @@ import (
 	"time"
 
 	fp "github.com/vinq1911/fragmind-pigeon/pkg/fragpigeon"
-	"golang.org/x/sys/unix"
 )
 
-// mkRing creates a temporary shared-memory ring buffer.
-// Returns the Ring handle and a cleanup function.
+// mkRing delegates to the shared CreateRing helper.
 func mkRing(dir string, name string, capSlots, slotSize int) (*fp.Ring, func(), error) {
-	size := 64 + capSlots*slotSize
-	path := filepath.Join(dir, name+".shm")
-
-	fd, err := unix.Open(path, unix.O_CREAT|unix.O_EXCL|unix.O_RDWR, 0600)
-	if err != nil {
-		fd, err = unix.Open(path, unix.O_RDWR, 0600)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-	if err := unix.Ftruncate(fd, int64(size)); err != nil {
-		unix.Close(fd)
-		return nil, nil, err
-	}
-
-	// Initialize ring control header
-	mem, err := unix.Mmap(fd, 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-	if err != nil {
-		unix.Close(fd)
-		return nil, nil, err
-	}
-	binary.LittleEndian.PutUint64(mem[0:], uint64(capSlots))
-	binary.LittleEndian.PutUint64(mem[8:], 0)                // ProdIdx
-	binary.LittleEndian.PutUint64(mem[16:], 0)               // ConsIdx
-	binary.LittleEndian.PutUint32(mem[24:], uint32(slotSize))
-	binary.LittleEndian.PutUint64(mem[32:], ^uint64(0))      // ProdEvtFD=-1 (poll mode)
-	binary.LittleEndian.PutUint64(mem[40:], ^uint64(0))      // ConsEvtFD=-1
-	_ = unix.Munmap(mem)
-	_ = os.Remove(path) // unlink, keep fd open
-
-	ring, err := fp.OpenRingFromFD(fd)
-	if err != nil {
-		unix.Close(fd)
-		return nil, nil, err
-	}
-
-	cleanup := func() {
-		ring.Close()
-		unix.Close(fd)
-	}
-	return ring, cleanup, nil
+	return fp.CreateRing(dir, name, capSlots, slotSize)
 }
 
 // BenchFragmindRing benchmarks the Ring transport for a given payload size.

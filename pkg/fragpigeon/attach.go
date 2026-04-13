@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -108,38 +107,8 @@ func createRingPair(dir string, fragID uint32, capSlots, slotSize int) (inRing *
 	return inRing, inFD, outRing, outFD, nil
 }
 
-func createRingFD(dir, name string, capSlots, slotSize int) (int, error) {
-	size := 64 + capSlots*slotSize
-	path := filepath.Join(dir, name+".shm")
-
-	fd, err := unix.Open(path, unix.O_CREAT|unix.O_EXCL|unix.O_RDWR, 0600)
-	if err != nil {
-		fd, err = unix.Open(path, unix.O_RDWR, 0600)
-		if err != nil {
-			return -1, err
-		}
-	}
-	if err := unix.Ftruncate(fd, int64(size)); err != nil {
-		unix.Close(fd)
-		return -1, err
-	}
-
-	mem, err := unix.Mmap(fd, 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-	if err != nil {
-		unix.Close(fd)
-		return -1, err
-	}
-	binary.LittleEndian.PutUint64(mem[0:], uint64(capSlots))
-	binary.LittleEndian.PutUint64(mem[8:], 0)                // ProdIdx
-	binary.LittleEndian.PutUint64(mem[16:], 0)               // ConsIdx
-	binary.LittleEndian.PutUint32(mem[24:], uint32(slotSize))
-	binary.LittleEndian.PutUint64(mem[32:], ^uint64(0))      // ProdEvtFD=-1
-	binary.LittleEndian.PutUint64(mem[40:], ^uint64(0))      // ConsEvtFD=-1
-	_ = unix.Munmap(mem)
-	_ = os.Remove(path) // unlink, keep fd open
-
-	return fd, nil
-}
+// createRingFD delegates to the shared CreateRingFD helper.
+var createRingFD = CreateRingFD
 
 // sendFDs sends file descriptors over a Unix domain socket using SCM_RIGHTS.
 // Uses Go's native UnixConn.WriteMsgUnix to avoid File() dup issues.

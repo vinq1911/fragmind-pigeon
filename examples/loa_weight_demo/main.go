@@ -12,7 +12,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"hash/crc32"
@@ -22,7 +21,6 @@ import (
 	"time"
 
 	fp "github.com/vinq1911/fragmind-pigeon/pkg/fragpigeon"
-	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -55,7 +53,7 @@ func main() {
 
 	// --- 2. Create shared-memory ring (producer → consumer) ---
 	ringSlotSize := fp.HdrSize + fp.LOARefSize + 16 // header + LOARef payload + padding
-	ring, ringCleanup, err := makeRing(dir, "ring-prod-cons", 256, ringSlotSize)
+	ring, ringCleanup, err := fp.CreateRing(dir, "ring-prod-cons", 256, ringSlotSize)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -178,39 +176,6 @@ func makeWeightShard(size int) []byte {
 	return buf
 }
 
-func makeRing(dir, name string, capSlots, slotSize int) (*fp.Ring, func(), error) {
-	size := 64 + capSlots*slotSize
-	path := filepath.Join(dir, name+".shm")
-
-	fd, err := unix.Open(path, unix.O_CREAT|unix.O_EXCL|unix.O_RDWR, 0600)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := unix.Ftruncate(fd, int64(size)); err != nil {
-		unix.Close(fd)
-		return nil, nil, err
-	}
-	mem, err := unix.Mmap(fd, 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-	if err != nil {
-		unix.Close(fd)
-		return nil, nil, err
-	}
-	binary.LittleEndian.PutUint64(mem[0:], uint64(capSlots))
-	binary.LittleEndian.PutUint64(mem[8:], 0)
-	binary.LittleEndian.PutUint64(mem[16:], 0)
-	binary.LittleEndian.PutUint32(mem[24:], uint32(slotSize))
-	binary.LittleEndian.PutUint64(mem[32:], ^uint64(0))
-	binary.LittleEndian.PutUint64(mem[40:], ^uint64(0))
-	_ = unix.Munmap(mem)
-	_ = os.Remove(path)
-
-	ring, err := fp.OpenRingFromFD(fd)
-	if err != nil {
-		unix.Close(fd)
-		return nil, nil, err
-	}
-	return ring, func() { ring.Close(); unix.Close(fd) }, nil
-}
 
 func humanBytes(b int) string {
 	switch {
