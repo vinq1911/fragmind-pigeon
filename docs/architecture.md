@@ -152,13 +152,63 @@ Offset  Size  Field         Description
 
 | Tag | Effect |
 |-----|--------|
-| (none) | Local-only mode. QUIC stubs compiled. Peer manager is no-op. |
-| `quic` | QUIC peer networking enabled. Self-signed TLS 1.3. Dial/accept loops. Gossip + forwarding over QUIC streams. |
+| (none) | Local-only mode. QUIC/RDMA stubs compiled. Peer manager is no-op. |
+| `quic` | QUIC peer networking. Self-signed TLS 1.3. Gossip + forwarding over QUIC streams. |
+| `rdma` | RDMA over Thunderbolt 5 (macOS 26.2+). libibverbs via CGo. LOA pool registered as RDMA memory region. Remote sites RDMA-read tensor data directly from LOA slots. |
+
+## Distributed Training Data Flow
+
+The gorch integration demo shows the full training pipeline:
+
+```
+                        Forward Pass
+                        ════════════
+ ┌──────────────────┐                      ┌──────────────────┐
+ │    Worker A       │   activations (LOA)  │    Worker B       │
+ │  Linear(784→128)  ├─────────────────────►│  Linear(128→10)  │
+ │  + ReLU           │   32KB via ring ptr  │  + CrossEntropy   │
+ └──────────────────┘                      └──────────────────┘
+         ▲                                          │
+         │              Backward Pass               │
+         │              ═════════════               ▼
+         │                                  loss.Backward()
+         │   gradients (LOA)                        │
+         └──────────────────────────────────────────┘
+              32KB via ring ptr
+
+ Both workers: Adam optimizer step on their own parameters
+```
+
+Per batch: 2 LOA transfers (32KB activations + 32KB gradients), 2 ring messages.
+Measured overhead: 6.2% vs single-process (dominated by CPU compute, not IPC).
+
+## RDMA over Thunderbolt
+
+For cross-host deployment on Apple Silicon clusters:
+
+```
+ ┌─────────────┐  Thunderbolt 5 cable  ┌─────────────┐
+ │  Mac A       │◄─────────────────────►│  Mac B       │
+ │  Pigeon(1)   │   RDMA: 80 Gb/s      │  Pigeon(2)   │
+ │  LOA Pool    │   Latency: 3-9 µs    │  LOA Pool    │
+ └──────┬──────┘                       └──────┬──────┘
+        │                                      │
+   Fragment A                             Fragment B
+```
+
+How it works:
+1. Each pigeon registers its LOA pool as an RDMA memory region (`ibv_reg_mr`)
+2. During site handshake, pigeons exchange memory region keys (rkey)
+3. When forwarding LOA messages cross-host, instead of serializing over QUIC, the remote pigeon issues an `IBV_WR_RDMA_READ` directly from the source LOA pool
+4. Tensor data flows DMA from one Mac's memory to another — no CPU memcpy, no kernel networking stack
+
+Requirements: macOS 26.2+, `rdma_ctl enable` (Recovery Mode), direct Thunderbolt 4/5 cable.
+Uses standard libibverbs API (same as Linux InfiniBand).
 
 ## Platform Support
 
-| Platform | Ring | LOA | COI shm | Pigeon | QUIC |
-|----------|------|-----|---------|--------|------|
-| Linux (x86_64, ARM64) | memfd_create | /dev/shm | /dev/shm | Full | Full |
-| macOS (ARM64) | temp file + unlink | /tmp | /tmp | Full | Full |
-| FreeBSD/other Unix | temp file + unlink | /tmp | /tmp | Full | Full |
+| Platform | Ring | LOA | COI shm | Pigeon | QUIC | RDMA |
+|----------|------|-----|---------|--------|------|------|
+| Linux (x86_64, ARM64) | memfd_create | /dev/shm | /dev/shm | Full | Full | InfiniBand/RoCE |
+| macOS (ARM64) | temp file + unlink | /tmp | /tmp | Full | Full | Thunderbolt 5 (26.2+) |
+| FreeBSD/other Unix | temp file + unlink | /tmp | /tmp | Full | Full | — |

@@ -27,10 +27,10 @@ bindings/python/
 ## Running Tests
 
 ```bash
-# All Go tests (unit + e2e)
+# All Go tests (unit + e2e, 48 tests)
 go test -v ./pkg/fragpigeon/
 
-# Just e2e tests
+# Just e2e tests (21 tests)
 go test -v -run TestE2E ./pkg/fragpigeon/
 
 # Microbenchmarks
@@ -42,9 +42,15 @@ go test -v -run TestProofRun ./proof/
 # Full proof run (report + Go benchmarks)
 bash proof/run.sh
 
-# Python tests
+# Multi-process demo (pigeon + producer + consumer)
+bash examples/multiprocess_demo/run.sh
+
+# Gorch distributed training demo
+CGO_ENABLED=1 go run ./examples/gorch_distributed -epochs 3
+
+# Python tests (31 tests)
 cd bindings/python
-python -m pytest test_fragpigeon.py -v
+python -m pytest test_fragpigeon.py test_numpy.py -v
 python -m pytest test_cross_language.py -v -s
 
 # Everything
@@ -74,6 +80,8 @@ go test ./... && cd bindings/python && python -m pytest -v
 | `COIRouting` | Fragment A -> pigeon -> Fragment B, no self-loop |
 | `MultiSubscriberRouting` | A -> pigeon -> B + C (fan-out to two subscribers) |
 | `LOARouting` | LOA pointer routed through pigeon, zero-copy deref |
+| `AttachSCMRights` | Real UDS FD passing via SCM_RIGHTS, bidirectional ring |
+| `TwoFragmentsAttachAndRoute` | Two fragments attach via Attach(), route via COI |
 
 ## Proof Benchmarks
 

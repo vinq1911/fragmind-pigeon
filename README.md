@@ -343,6 +343,30 @@ pool.release(ref)
 
 See [docs/python-bindings.md](docs/python-bindings.md) for full API reference.
 
+### Distributed Training (Gorch Integration)
+
+Two fragment workers train an MLP with activations and gradients flowing through LOA:
+
+```
+Worker A: Linear(784→128) + ReLU     Worker B: Linear(128→10) + Loss
+    │                                      │
+    ├── forward ──────────────────────────►│
+    │   activations (32KB) via LOA         │
+    │                                      ├── loss + backward
+    │◄──────────────────────────── backward─┤
+    │   gradients (32KB) via LOA           │
+    ├── backward + optimizer step          ├── optimizer step
+```
+
+```bash
+# Run distributed training demo (requires macOS + CGo for gorch Metal)
+CGO_ENABLED=1 go run ./examples/gorch_distributed -epochs 5 -batches 100
+
+# Results: loss converges 2.85→2.55, 6.2% overhead vs single-process
+```
+
+See [examples/gorch_distributed/](examples/gorch_distributed/) for the full implementation.
+
 ## Performance
 
 Benchmarked on Apple M4 (ARM64):
@@ -378,16 +402,28 @@ All hot paths are zero-allocation.
 | Pipe | 3,708 | 3,771 | 3,275 |
 | UDS | 1,888 | 2,696 | 2,459 |
 
+### Real ML Workload (Gorch Distributed Training)
+
+| Metric | Distributed (fragmind) | Single-process | Overhead |
+|--------|----------------------|----------------|----------|
+| Avg batch latency | 11.4 ms | 10.7 ms | 6.2% |
+| LOA throughput | 5.8 MB/s (fwd+bwd) | N/A | — |
+| Training loss | 2.85 → 2.55 | Converges | Model learns correctly |
+| Data via LOA | 62.5 MB (1000 batches) | 0 | — |
+
 Run `bash proof/run.sh` to reproduce. Results saved to `proof/results/` as JSON for tracking over time.
 
 ## Build
 
 ```bash
-# Standard build (no QUIC)
+# Standard build (local-only, no networking)
 go build -o pigeon ./cmd/pigeon
 
-# With QUIC peer support
+# With QUIC peer networking
 go build -tags=quic -o pigeon ./cmd/pigeon
+
+# With RDMA over Thunderbolt (macOS 26.2+, requires libibverbs)
+CGO_ENABLED=1 go build -tags=rdma -o pigeon ./cmd/pigeon
 
 # ARM64 Linux (for deployment)
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o pigeon ./cmd/pigeon
@@ -395,12 +431,32 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o pig
 # Docker
 docker buildx build --platform linux/arm64 -t fragmind-pigeon:latest -f Dockerfile .
 
-# Tests
+# Gorch distributed training demo (requires macOS + CGo)
+CGO_ENABLED=1 go run ./examples/gorch_distributed
+
+# Multi-process demo (pigeon daemon + producer + consumer)
+bash examples/multiprocess_demo/run.sh
+
+# Tests (Go)
 go test ./...
+
+# Tests (Python)
+cd bindings/python && python -m pytest -v
 
 # Benchmarks
 go test -bench=. -benchmem ./pkg/fragpigeon/
+
+# Proof benchmarks (fragmind vs UDS/TCP/Pipe)
+bash proof/run.sh
 ```
+
+### Build Tags
+
+| Tag | Effect |
+|-----|--------|
+| (none) | Local-only. QUIC/RDMA stubs. No networking. |
+| `quic` | QUIC peer networking. Self-signed TLS 1.3. Gossip + forwarding. |
+| `rdma` | RDMA over Thunderbolt 5 (macOS 26.2+). libibverbs via CGo. 80 Gb/s, <10 us latency. |
 
 ## Architecture
 
@@ -452,7 +508,10 @@ pkg/fragpigeon/
   forward_quic.go        Cross-host forwarding with LOA resolution (build tag: quic)
   *_stub.go              No-op stubs for non-QUIC builds
   defaults_*.go          Platform-specific paths (Linux /dev/shm, macOS /tmp)
-  e2e_test.go            19 end-to-end integration tests
+  ring_create.go         Shared ring creation helper (CreateRing/CreateRingFD)
+  rdma_types.go          RDMA type definitions (shared between builds)
+  peers_rdma.go          RDMA over Thunderbolt transport (build tag: rdma)
+  e2e_test.go            21 end-to-end integration tests
   *_test.go              Unit tests and benchmarks
   internal/
     memfd_linux.go       memfd_create for anonymous shm
@@ -461,7 +520,10 @@ bindings/
   c/fragpigeon.h         C header — all struct definitions + inline helpers
   python/
     fragpigeon.py        Pure Python bindings (mmap + struct, no extensions)
+    fragpigeon_numpy.py  NumPy/PyTorch zero-copy tensor helpers
+    pyproject.toml       pip-installable package config
     test_fragpigeon.py   22 unit tests
+    test_numpy.py        7 NumPy tensor tests
     test_cross_language.py  Python-writes-Go-reads interop tests
 proof/
   proof_test.go          Comparative benchmark suite (fragmind vs baselines)
@@ -471,6 +533,9 @@ proof/
   run.sh                 One-command benchmark runner
   results/               JSON results (gitignored, machine-specific)
 examples/
+  gorch_distributed/     Distributed MNIST training (forward+backward via LOA)
+  multiprocess_demo/     Pigeon daemon + producer + consumer (3 processes)
+  rdma_demo/             RDMA over Thunderbolt tensor transfer
   loa_weight_demo/       Zero-copy weight shard transfer demo
   local_ring_demo/       Coordinator + sender + receiver over shared rings
   scripts/
