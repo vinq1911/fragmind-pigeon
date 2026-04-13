@@ -6,3 +6,4 @@
 proof/results/*.json
 __pycache__/
 /gorch_distributed
+.DS_Store

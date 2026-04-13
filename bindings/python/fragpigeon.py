@@ -25,7 +25,9 @@ Usage:
 import ctypes
 import mmap
 import os
+import socket as _socket_mod
 import struct
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -548,3 +550,246 @@ def read_loa(ring: Ring, pool: LOAPool, timeout_s: float = 0
 
 def _align_up(v: int, align: int) -> int:
     return (v + align - 1) & ~(align - 1)
+
+
+# ================================================================
+# Pigeon Attach (SCM_RIGHTS)
+# ================================================================
+
+# UDS op codes (must match Go coi.go)
+_OP_REGISTER = 0
+_OP_RENEW = 1
+_OP_UNREG = 2
+_OP_LIST = 3
+_OP_LOAINFO = 4
+_OP_ATTACH = 5
+
+
+@dataclass
+class AttachResult:
+    """Result of attaching to a pigeon daemon."""
+    frag_id: int
+    in_ring: Ring     # read from this (messages routed to you)
+    out_ring: Ring    # write to this (pigeon routes your messages)
+    _sock_path: str = ""
+
+    def close(self):
+        self.in_ring.close()
+        self.out_ring.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def attach(socket_path: str = "/tmp/pigeon.sock") -> AttachResult:
+    """Attach to a running pigeon daemon.
+
+    Sends an ATTACH request over UDS, receives ring pair FDs via SCM_RIGHTS.
+    Returns an AttachResult with in_ring (read) and out_ring (write).
+
+    The pigeon creates two shared-memory rings for this fragment:
+    - in_ring: pigeon writes messages routed to you; you read from it
+    - out_ring: you write messages; pigeon reads and routes them
+
+    Example:
+        att = attach("/tmp/pigeon.sock")
+        att.out_ring.try_write(header, payload)  # send
+        msg = att.in_ring.try_read()              # receive
+        att.close()
+    """
+    sock = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
+    sock.connect(socket_path)
+
+    # Send ATTACH request: [op=5, count=0, fragID=0]
+    req = struct.pack("<BBH", _OP_ATTACH, 0, 0)
+    sock.sendall(req)
+
+    # Receive FDs via SCM_RIGHTS + 4-byte fragID
+    msg, ancdata, flags, addr = sock.recvmsg(64, _socket_mod.CMSG_LEN(2 * struct.calcsize("i")))
+
+    received_fds = []
+    for cmsg_level, cmsg_type, cmsg_data in ancdata:
+        if cmsg_level == _socket_mod.SOL_SOCKET and cmsg_type == _socket_mod.SCM_RIGHTS:
+            n_fds = len(cmsg_data) // struct.calcsize("i")
+            received_fds.extend(
+                struct.unpack(f"{n_fds}i", cmsg_data[:n_fds * struct.calcsize("i")])
+            )
+
+    sock.close()
+
+    if len(received_fds) < 2:
+        raise RuntimeError(f"expected 2 FDs from pigeon, got {len(received_fds)}")
+    if len(msg) < 4:
+        raise RuntimeError(f"expected 4B fragID, got {len(msg)}")
+
+    frag_id = struct.unpack_from("<I", msg, 0)[0]
+    in_fd = received_fds[0]
+    out_fd = received_fds[1]
+
+    in_ring = Ring.from_fd(in_fd)
+    out_ring = Ring.from_fd(out_fd)
+
+    return AttachResult(
+        frag_id=frag_id,
+        in_ring=in_ring,
+        out_ring=out_ring,
+        _sock_path=socket_path,
+    )
+
+
+# ================================================================
+# COI Client (register/renew/unregister over UDS)
+# ================================================================
+
+@dataclass
+class COI:
+    """Concept of Interest subscription."""
+    concept_id: int
+    bits: int
+    schema_id: int
+    flags: int = 0
+
+
+class COIClient:
+    """Client for COI registration with the pigeon daemon.
+
+    Example:
+        client = COIClient("/tmp/pigeon.sock", frag_id=att.frag_id)
+        client.register([COI(concept_id=0x0001000000000000, bits=16, schema_id=1)])
+        # ... use rings ...
+        client.unregister([COI(...)])
+        client.close()
+    """
+
+    def __init__(self, socket_path: str = "/tmp/pigeon.sock", frag_id: int = 0):
+        self._sock = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
+        self._sock.connect(socket_path)
+        self._frag_id = frag_id
+
+    def _send(self, op: int, cois: list[COI]):
+        n = 4 + len(cois) * 16
+        buf = bytearray(n)
+        buf[0] = op
+        buf[1] = len(cois) & 0xFF
+        struct.pack_into("<H", buf, 2, self._frag_id & 0xFFFF)
+        off = 4
+        for c in cois:
+            struct.pack_into("<Q", buf, off, c.concept_id)
+            struct.pack_into("<H", buf, off + 8, c.bits)
+            struct.pack_into("<H", buf, off + 10, c.schema_id)
+            struct.pack_into("<H", buf, off + 12, c.flags)
+            off += 16
+        self._sock.sendall(buf)
+
+    def register(self, cois: list[COI]):
+        """Register COIs with the pigeon (starts lease)."""
+        self._send(_OP_REGISTER, cois)
+
+    def renew(self, cois: list[COI]):
+        """Renew COI leases."""
+        self._send(_OP_RENEW, cois)
+
+    def unregister(self, cois: list[COI]):
+        """Remove COI registrations."""
+        self._send(_OP_UNREG, cois)
+
+    def loa_info(self) -> str:
+        """Query the LOA pool path from pigeon."""
+        hdr = struct.pack("<BBH", _OP_LOAINFO, 0, 0)
+        self._sock.sendall(hdr)
+        resp = self._sock.recv(1024)
+        if len(resp) < 2:
+            raise RuntimeError("short LOAINFO response")
+        path_len = struct.unpack_from("<H", resp, 0)[0]
+        return resp[2:2 + path_len].decode()
+
+    def close(self):
+        self._sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class COIHandle:
+    """Auto-renewing COI registration handle.
+
+    Example:
+        handle = COIHandle.start(
+            socket_path="/tmp/pigeon.sock",
+            frag_id=att.frag_id,
+            cois=[COI(concept_id=0x0001000000000000, bits=16, schema_id=1)],
+        )
+        # ... COIs auto-renew in background ...
+        handle.close()
+    """
+
+    def __init__(self, client: COIClient, cois: list[COI], renew_interval: float = 1.0):
+        self._client = client
+        self._cois = list(cois)
+        self._interval = renew_interval
+        self._stop = False
+        self._thread: Optional["threading.Thread"] = None
+
+    @classmethod
+    def start(cls, socket_path: str, frag_id: int, cois: list[COI],
+              renew_interval: float = 1.0) -> "COIHandle":
+        """Connect, register COIs, and start auto-renewal."""
+        client = COIClient(socket_path, frag_id)
+        client.register(cois)
+        handle = cls(client, cois, renew_interval)
+
+        def _renew_loop():
+            while not handle._stop:
+                time.sleep(handle._interval)
+                if handle._stop:
+                    break
+                try:
+                    handle._client.renew(handle._cois)
+                except Exception:
+                    break
+
+        handle._thread = threading.Thread(target=_renew_loop, daemon=True)
+        handle._thread.start()
+        return handle
+
+    def update(self, cois: list[COI]):
+        """Update the COI set and renew immediately."""
+        self._cois = list(cois)
+        self._client.renew(self._cois)
+
+    def close(self):
+        """Stop renewal and unregister."""
+        self._stop = True
+        if self._thread:
+            self._thread.join(timeout=2)
+        try:
+            self._client.unregister(self._cois)
+        except Exception:
+            pass
+        self._client.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def discover_loa_pool(socket_path: str = "/tmp/pigeon.sock") -> LOAPool:
+    """Query the pigeon for its LOA pool path and open it.
+
+    Example:
+        pool = discover_loa_pool("/tmp/pigeon.sock")
+        buf, ref = pool.alloc(4096, owner_frag_id=1)
+    """
+    with COIClient(socket_path) as client:
+        path = client.loa_info()
+    if not path:
+        raise RuntimeError("pigeon has no LOA pool")
+    return LOAPool.open(path)
