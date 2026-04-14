@@ -8,7 +8,7 @@ require (
 )
 
 require (
-	github.com/vinq1911/gorch v0.0.0-20260413163332-13828ed24fc7 // indirect
+	github.com/vinq1911/gorch v0.0.0-20260413164244-079abbd6d4b6 // indirect
 	go.uber.org/mock v0.5.0 // indirect
 	golang.org/x/crypto v0.26.0 // indirect
 	golang.org/x/mod v0.18.0 // indirect
