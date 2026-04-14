@@ -7,3 +7,6 @@ proof/results/*.json
 __pycache__/
 /gorch_distributed
 .DS_Store
+/gorch_gpt_distributed
+/gorch_gpt_training
+/rdma_demo
